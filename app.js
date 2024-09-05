@@ -2,199 +2,171 @@ require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
 const bodyParser = require('body-parser');
+const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
+const { Storage } = require('@google-cloud/storage');
+const fs = require('fs');
 const cron = require('node-cron');
 
-// ESPN API endpoints
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+
+const port = process.env.PORT || 3000;
+const accessToken = process.env.ACCESS_TOKEN;
+const whatsappApiUrl = process.env.WHATSAPP_API_URL;
+
 const nflScoreboardApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 const nflTeamApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams';
 
-const accessToken = process.env.ACCESS_TOKEN; // Using environment variable for access token
-const whatsappApiUrl = process.env.WHATSAPP_API_URL; 
+const ttsClient = new TextToSpeechClient({ keyFilename: process.env.TTS_KEY_FILE });
+const storage = new Storage({ keyFilename: process.env.STORAGE_KEY_FILE });
+const bucketName = process.env.BUCKET_NAME;
 
-(async () => {
-    // Express setup
-    const app = express();
-    app.use(bodyParser.urlencoded({ extended: false }));
-    app.use(bodyParser.json());
-    const port = process.env.PORT || 3000;
+let userPreferences = {};
 
-    // In-memory storage for users who opt-in and prompts
-    const optInUsers = {};
-
-    // Function to send a message via WhatsApp API
-    async function sendMessage(message, number) {
-        try {
-            const payload = {
-                messaging_product: "whatsapp",
-                to: number,
-                type: "text",
-                text: {
-                    body: message
-                }
-            };
-            const response = await axios.post(whatsappApiUrl, payload, {
-                headers: {
-                    Authorization: `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                }
-            });
-            console.log('Message sent to', number, ':', response.data);
-        } catch (error) {
-            console.error(`Failed to send message to ${number}:`, error.response ? error.response.data : error.message);
-            if (error.response && error.response.data.error.code === 190) {
-                console.error('Access token expired. Please refresh the token.');
-            }
-        }
+async function sendMessage(message, number) {
+    try {
+        const payload = {
+            messaging_product: "whatsapp",
+            to: number,
+            type: "text",
+            text: { body: message }
+        };
+        await axios.post(whatsappApiUrl, payload, {
+            headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        console.error(`Failed to send message: ${error.response ? error.response.data : error.message}`);
     }
+}
 
-    // Expanded NFL Scores Command
-    async function getNflScoresDetailed() {
-        try {
-            const response = await axios.get(nflScoreboardApiUrl);
-            const scoreboard = response.data;
-
-            if (!scoreboard || scoreboard.events.length === 0) {
-                return { message: 'No games are currently available.', data: [] };
-            }
-
-            let message = 'NFL Scores and Details:\n';
-            scoreboard.events.forEach(event => {
-                const homeTeam = event.competitions[0].competitors[0].team.displayName;
-                const awayTeam = event.competitions[0].competitors[1].team.displayName;
-                const homeScore = event.competitions[0].competitors[0].score;
-                const awayScore = event.competitions[0].competitors[1].score;
-
-                const venue = event.competitions[0].venue.fullName;
-                const location = `${event.competitions[0].venue.address.city}, ${event.competitions[0].venue.address.state}`;
-                const broadcasts = event.competitions[0].broadcasts.map(broadcast => broadcast.names.join(', ')).join(' | ');
-                const odds = event.competitions[0].odds.map(odd => `${odd.details} (O/U: ${odd.overUnder})`).join(', ');
-
-                message += `${homeTeam} vs ${awayTeam}: ${homeScore} - ${awayScore}\n`;
-                message += `Venue: ${venue} (${location})\n`;
-                message += `Broadcasts: ${broadcasts}\n`;
-                message += `Odds: ${odds}\n`;
-                message += `------------------------\n`;
-            });
-
-            return { message, data: scoreboard.events };
-        } catch (error) {
-            console.error('Error fetching NFL scores:', error);
-            return { message: 'Error fetching NFL scores.', data: [] };
-        }
+async function fetchNflScores() {
+    try {
+        const response = await axios.get(nflScoreboardApiUrl);
+        return response.data;
+    } catch (error) {
+        console.error('Error fetching NFL scores:', error);
+        return null;
     }
+}
 
-    // Expanded Team Info Command
-    async function getTeamInfoDetailed(teamName) {
-        try {
-            const response = await axios.get(nflTeamApiUrl);
-            const teams = response.data.sports[0].leagues[0].teams;
-            const matchedTeam = teams.find(team => team.team.displayName.toLowerCase() === teamName.toLowerCase());
-
-            if (matchedTeam) {
-                const team = matchedTeam.team;
-                const record = team.record.items.map(item => `${item.name}: ${item.summary}`).join(', ');
-                const scheduleLink = team.links.find(link => link.rel.includes('schedule')).href;
-                const rosterLink = team.links.find(link => link.rel.includes('roster')).href;
-
-                let message = `${team.displayName} Info:\n`;
-                message += `Location: ${team.location}\n`;
-                message += `Record: ${record}\n`;
-                message += `Colors: ${team.color} (Primary), ${team.alternateColor} (Alternate)\n`;
-                message += `Upcoming Schedule: ${scheduleLink}\n`;
-                message += `Roster: ${rosterLink}\n`;
-                message += `------------------------\n`;
-
-                return message;
-            } else {
-                return `Team ${teamName} not found.`;
-            }
-        } catch (error) {
-            console.error('Error fetching team info:', error);
-            return `Error fetching team info.`;
-        }
+async function fetchTeamInfo(teamName) {
+    try {
+        const response = await axios.get(nflTeamApiUrl);
+        const teams = response.data.sports[0].leagues[0].teams;
+        return teams.find(team => team.team.displayName.toLowerCase() === teamName.toLowerCase());
+    } catch (error) {
+        console.error('Error fetching team info:', error);
+        return null;
     }
+}
 
-    // Expanded Follow Teams Command
-    async function followTeamsDetailed(teamNames, frequency, optInUsers, number) {
-        const teams = teamNames.split(',').map(name => name.trim());
-        optInUsers[number] = { teams, frequency };
-        scheduleNflUpdatesDetailed(optInUsers, number);
-        return `You have opted in to receive detailed updates for teams: ${teamNames} every ${frequency} minutes.`;
-    }
+function formatGameSummary(game) {
+    const home = game.competitions[0].competitors[0];
+    const away = game.competitions[0].competitors[1];
+    return `${home.team.displayName} vs ${away.team.displayName}: ${home.score} - ${away.score}`;
+}
 
-    function scheduleNflUpdatesDetailed(optInUsers, number) {
-        const user = optInUsers[number];
-        if (user.teams.length > 0) {
-            const job = cron.schedule(`*/${user.frequency} * * * *`, async () => {
-                const teamUpdates = await Promise.all(user.teams.map(team => getTeamInfoDetailed(team)));
-                const message = teamUpdates.join('\n');
-                sendMessage(message, number);
-            });
-            user.job = job;
-        }
-    }
+function formatVenueInfo(game) {
+    const venue = game.competitions[0].venue;
+    return `Venue: ${venue.fullName} (${venue.address.city}, ${venue.address.state})`;
+}
 
-    // Expanded Finish Updates Command
-    function finishUpdates(optInUsers, number) {
-        if (optInUsers[number] && optInUsers[number].job) {
-            optInUsers[number].job.stop();
-            delete optInUsers[number];
-            return 'You have successfully opted out of updates.';
-        } else {
-            return 'You are not currently receiving updates.';
-        }
-    }
+function formatBroadcastInfo(game) {
+    const broadcasts = game.competitions[0].broadcasts.map(b => b.names.join(', ')).join(', ');
+    return `Broadcasts: ${broadcasts}`;
+}
 
-    // Expanded Welcome Message
-    function sendWelcomeMessage(number) {
-        const welcomeMessage = `🎉 Welcome to NFL Feed! 🏈
+function formatOddsInfo(game) {
+    const odds = game.competitions[0].odds[0];
+    return `Odds: ${odds.homeTeamOdds.team.abbreviation} ${odds.details} (O/U: ${odds.overUnder})`;
+}
+
+async function sendHelpMessage(number) {
+    const message = `🎉 Welcome to Football Feed! 🏈
 
 Here are some commands you can use:
-- "nfl scores" 📊: Get the current NFL scores with detailed information including venue, broadcasts, and odds.
-- "team [team name]" 🏈: Get detailed stats, records, and upcoming schedules for a specific team.
-- "follow [team names] [minutes]" 🏈: Receive detailed updates for specific teams at your chosen interval.
+- "nfl scores" 📊: Get the current NFL scores.
+- "team [team name]" 🏈: Get the stats for a specific team.
+- "follow [team names] [minutes]" 🏈: Receive updates for specific teams at your chosen interval.
 - "finish updates" 🚫: Stop receiving updates.
+- "game score [team]" 🏟️: Get the score of a game involving a specific team.
+- "venue [team]" 🏟️: Get the venue information of a game involving a specific team.
+- "TV [team]" 📺: Get the broadcast information of a game involving a specific team.
+- "odds [team]" 🎲: Get the odds information of a game involving a specific team.
+- "set favorite [team]" ⭐: Set your favorite team to get quick updates.
+- "my team" 🏈: Get updates about your favorite team.
+- "help" 📖: Display this help message.
 
 Enjoy and stay tuned for NFL updates! 🏈`;
 
-        sendMessage(welcomeMessage, number);
-    }
+    await sendMessage(message, number);
+}
 
-    // Handle incoming messages and commands
-    app.post('/webhook', async (req, res) => {
-        try {
-            const incomingMsg = req.body.entry[0].changes[0].value.messages[0].text.body.trim().toLowerCase();
-            const fromNumber = req.body.entry[0].changes[0].value.messages[0].from;
+app.post('/webhook', async (req, res) => {
+    try {
+        const incomingMsg = req.body.entry[0].changes[0].value.messages[0].text.body.trim().toLowerCase();
+        const fromNumber = req.body.entry[0].changes[0].value.messages[0].from;
 
-            if (incomingMsg === 'nfl scores') {
-                const scoresData = await getNflScoresDetailed();
-                sendMessage(scoresData.message, fromNumber);
-            } else if (incomingMsg.startsWith('team ')) {
-                const teamName = incomingMsg.slice(5).trim();
-                const teamInfoMessage = await getTeamInfoDetailed(teamName);
-                sendMessage(teamInfoMessage, fromNumber);
-            } else if (incomingMsg.startsWith('follow ')) {
-                const parts = incomingMsg.split(' ');
-                const teamNames = parts.slice(1, parts.length - 1).join(' ');
-                const frequency = parseInt(parts[parts.length - 1], 10);
-                const followMessage = await followTeamsDetailed(teamNames, frequency, optInUsers, fromNumber);
-                sendMessage(followMessage, fromNumber);
-            } else if (incomingMsg === 'finish updates') {
-                const finishMessage = finishUpdates(optInUsers, fromNumber);
-                sendMessage(finishMessage, fromNumber);
+        if (incomingMsg === 'start' || incomingMsg === 'help') {
+            await sendHelpMessage(fromNumber);
+        } else if (incomingMsg === 'nfl scores') {
+            const scoreboard = await fetchNflScores();
+            const message = scoreboard.events.map(game => formatGameSummary(game)).join('\n');
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('team ')) {
+            const teamName = incomingMsg.slice(5).trim();
+            const teamInfo = await fetchTeamInfo(teamName);
+            const message = teamInfo ? `${teamInfo.team.displayName} Stats:\n${JSON.stringify(teamInfo.team, null, 2)}` : `Team ${teamName} not found.`;
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('game score ')) {
+            const teamName = incomingMsg.slice(11).trim();
+            const scoreboard = await fetchNflScores();
+            const game = scoreboard.events.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatGameSummary(game) : `No game found for ${teamName}.`;
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('venue ')) {
+            const teamName = incomingMsg.slice(6).trim();
+            const scoreboard = await fetchNflScores();
+            const game = scoreboard.events.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatVenueInfo(game) : `No game found for ${teamName}.`;
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('tv ')) {
+            const teamName = incomingMsg.slice(3).trim();
+            const scoreboard = await fetchNflScores();
+            const game = scoreboard.events.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatBroadcastInfo(game) : `No game found for ${teamName}.`;
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('odds ')) {
+            const teamName = incomingMsg.slice(5).trim();
+            const scoreboard = await fetchNflScores();
+            const game = scoreboard.events.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatOddsInfo(game) : `No game found for ${teamName}.`;
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('set favorite ')) {
+            const teamName = incomingMsg.slice(13).trim();
+            userPreferences[fromNumber] = teamName;
+            await sendMessage(`Your favorite team is set to ${teamName}.`, fromNumber);
+        } else if (incomingMsg === 'my team') {
+            const teamName = userPreferences[fromNumber];
+            if (teamName) {
+                const teamInfo = await fetchTeamInfo(teamName);
+                const message = teamInfo ? `${teamInfo.team.displayName} Stats:\n${JSON.stringify(teamInfo.team, null, 2)}` : `Team ${teamName} not found.`;
+                await sendMessage(message, fromNumber);
             } else {
-                sendWelcomeMessage(fromNumber);
+                await sendMessage(`You haven't set a favorite team yet. Use "set favorite [team]" to set one.`, fromNumber);
             }
-
-            res.send('<Response></Response>');
-        } catch (error) {
-            console.error('Error handling webhook:', error);
-            res.status(500).send('Internal server error');
+        } else {
+            await sendMessage(`Unknown command. Type "help" to see available commands.`, fromNumber);
         }
-    });
 
-    // Start the Express server
-    app.listen(port, () => {
-        console.log('Server is running on port', port);
-    });
-})();
+        res.sendStatus(200);
+    } catch (error) {
+        console.error('Error handling webhook:', error);
+        res.status(500).send('Internal server error');
+    }
+});
+
+app.listen(port, () => {
+    console.log(`Server is running on port ${port}`);
+});
