@@ -2,7 +2,6 @@ require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
 const bodyParser = require('body-parser');
-
 const stringSimilarity = require('string-similarity');
 const cron = require('node-cron');
 const { createCanvas } = require('canvas');
@@ -11,41 +10,109 @@ const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
 const { Storage } = require('@google-cloud/storage');
 const fs = require('fs');
 
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN; // The token you set up in the Facebook Developer Console
+const WHATSAPP_API_URL = process.env.WHATSAPP_API_URL;
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 
 // ESPN API endpoints
 const nflScoreboardApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 const nflTeamApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams';
 
-const accessToken = process.env.ACCESS_TOKEN; // Using environment variable for access token
-const whatsappApiUrl = 'https://graph.facebook.com/v13.0/355645230970425/messages';
-
 (async () => {
-    // Google Cloud Text-to-Speech and Storage
-    const ttsClient = new TextToSpeechClient({
-        keyFilename: process.env.TTS_KEY_FILE // Ensure this path is correct
-    });
-    const storage = new Storage({
-        keyFilename: process.env.STORAGE_KEY_FILE // Ensure this path is correct
-    });
-    const bucketName = process.env.BUCKET_NAME; // Google Cloud Storage bucket name
-
-    // Express setup
-    const app = express();
-    app.use(bodyParser.urlencoded({ extended: false }));
-    app.use(bodyParser.json());
-    const port = process.env.PORT || 3000;
+    // Google Cloud Text-to-Speech and Storage setup
+    const ttsClient = new TextToSpeechClient({ keyFilename: process.env.TTS_KEY_FILE });
+    const storage = new Storage({ keyFilename: process.env.STORAGE_KEY_FILE });
+    const bucketName = process.env.BUCKET_NAME;
 
     // In-memory storage for users who opt-in and prompts
     const optInUsers = {};
     const userPrompts = [];
     const lastMessages = {}; // To store the last message sent to each user
 
+    // Webhook verification endpoint
+    app.get('/webhook', (req, res) => {
+        const mode = req.query['hub.mode'];
+        const token = req.query['hub.verify_token'];
+        const challenge = req.query['hub.challenge'];
+
+        if (mode && token) {
+            if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+                console.log('WEBHOOK_VERIFIED');
+                res.status(200).send(challenge);
+            } else {
+                res.status(403).send('Verification failed');
+            }
+        } else {
+            res.status(400).send('Bad Request');
+        }
+    });
+
+    // Handle incoming messages from WhatsApp
+    app.post('/webhook', async (req, res) => {
+        try {
+            console.log('Incoming webhook payload:', JSON.stringify(req.body, null, 2));
+
+            if (!req.body.entry || !req.body.entry[0].changes[0].value.messages[0]) {
+                console.log('Invalid webhook payload:', JSON.stringify(req.body, null, 2));
+                return res.status(400).send('Invalid webhook payload');
+            }
+
+            const incomingMsg = req.body.entry[0].changes[0].value.messages[0].text.body.trim();
+            const fromNumber = req.body.entry[0].changes[0].value.messages[0].from;
+
+            console.log(`Received message from ${fromNumber}: ${incomingMsg}`);
+
+            userPrompts.push(incomingMsg); // Save the prompt
+            const parts = incomingMsg.toLowerCase().split(' ');
+
+            if (parts[0] === 'start') {
+                sendWelcomeMessage(fromNumber);
+            } else if (incomingMsg.toLowerCase() === 'nfl scores') {
+                const scoresData = await getNflScores();
+                sendMessage(scoresData.message, fromNumber);
+            } else if (incomingMsg.toLowerCase().startsWith('team ')) {
+                const teamName = incomingMsg.slice(5).trim();
+                const teamInfoMessage = await getTeamInfo(teamName);
+                sendMessage(teamInfoMessage, fromNumber);
+            } else if (incomingMsg.toLowerCase().startsWith('follow ')) {
+                const teamNames = incomingMsg.slice(7).trim();
+                const frequency = parseInt(parts[parts.length - 1], 10);
+                if (!isNaN(frequency)) {
+                    if (optInUsers[fromNumber] && optInUsers[fromNumber].job) {
+                        optInUsers[fromNumber].job.stop();
+                    }
+                    optInUsers[fromNumber] = { teams: teamNames.split(','), frequency };
+                    scheduleNflUpdates();
+                    sendMessage(`You have opted in to receive updates for teams: ${teamNames} every ${frequency} minutes.`, fromNumber);
+                } else {
+                    sendMessage('Please provide a valid frequency in minutes.', fromNumber);
+                }
+            } else if (incomingMsg.toLowerCase() === 'finish updates') {
+                if (optInUsers[fromNumber] && optInUsers[fromNumber].job) {
+                    optInUsers[fromNumber].job.stop();
+                    delete optInUsers[fromNumber].job;
+                }
+                sendMessage('You have successfully opted out of updates.', fromNumber);
+            } else {
+                handleMultipleTeams(incomingMsg, fromNumber);
+            }
+
+            res.send('<Response></Response>');
+        } catch (error) {
+            console.error('Error handling webhook:', error);
+            res.status(500).send('Internal server error');
+        }
+    });
+
     // Function to send a message via WhatsApp API
     async function sendMessage(message, number) {
         // Check for duplicate messages
         if (lastMessages[number] && lastMessages[number] === message) {
-            console.log(chalk.yellow(`Duplicate message to ${number} detected, skipping send.`));
+            console.log(`Duplicate message to ${number} detected, skipping send.`);
             return;
         }
 
@@ -54,106 +121,25 @@ const whatsappApiUrl = 'https://graph.facebook.com/v13.0/355645230970425/message
                 messaging_product: "whatsapp",
                 to: number,
                 type: "text",
-                text: {
-                    body: message
-                }
+                text: { body: message }
             };
-            console.log('Payload:', JSON.stringify(payload)); // Logging payload
 
-            const response = await axios.post(whatsappApiUrl, payload, {
+            console.log('Payload:', JSON.stringify(payload));
+
+            const response = await axios.post(WHATSAPP_API_URL, payload, {
                 headers: {
-                    Authorization: `Bearer ${accessToken}`,
+                    Authorization: `Bearer ${ACCESS_TOKEN}`,
                     'Content-Type': 'application/json'
                 }
             });
 
-            console.log(chalk.green('Message sent to', number, ':', response.data));
+            console.log('Message sent to', number, ':', response.data);
             lastMessages[number] = message; // Update the last message sent
         } catch (error) {
-            console.error(chalk.red(`Failed to send message to ${number}:`, error.response ? error.response.data : error.message));
+            console.error(`Failed to send message to ${number}:`, error.response ? error.response.data : error.message);
             if (error.response && error.response.data.error.code === 190) {
-                console.error(chalk.red('Access token expired. Please refresh the token.'));
+                console.error('Access token expired. Please refresh the token.');
             }
-        }
-    }
-
-    // Function to send an image message via WhatsApp API
-    async function sendImageMessage(imageUrl, number) {
-        try {
-            const payload = {
-                messaging_product: "whatsapp",
-                to: number,
-                type: "image",
-                image: {
-                    link: imageUrl
-                }
-            };
-            console.log('Payload:', JSON.stringify(payload)); // Logging payload
-
-            const response = await axios.post(whatsappApiUrl, payload, {
-                headers: {
-                    Authorization: `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                }
-            });
-
-            console.log(chalk.green('Image message sent to', number, ':', response.data));
-        } catch (error) {
-            console.error(chalk.red(`Failed to send image message to ${number}:`, error.response.data));
-        }
-    }
-
-    // Function to send an audio message via WhatsApp API
-    async function sendAudioMessage(audioUrl, number) {
-        try {
-            const payload = {
-                messaging_product: "whatsapp",
-                to: number,
-                type: "audio",
-                audio: {
-                    link: audioUrl
-                }
-            };
-            console.log('Payload:', JSON.stringify(payload)); // Logging payload
-
-            const response = await axios.post(whatsappApiUrl, payload, {
-                headers: {
-                    Authorization: `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                }
-            });
-
-            console.log(chalk.green('Audio message sent to', number, ':', response.data));
-        } catch (error) {
-            console.error(chalk.red(`Failed to send audio message to ${number}:`, error.response.data));
-        }
-    }
-
-    // Function to generate and upload audio commentary using Google Cloud Text-to-Speech
-    async function generateAndUploadAudio(text, fileName, fromNumber) {
-        const ssmlText = `
-            <speak>
-                ${text.replace(/\n/g, '<break time="500ms"/>')}
-            </speak>`;
-
-        const request = {
-            input: { ssml: ssmlText },
-            voice: { languageCode: 'en-US', ssmlGender: 'MALE' },
-            audioConfig: { audioEncoding: 'MP3' },
-        };
-
-        try {
-            const [response] = await ttsClient.synthesizeSpeech(request);
-            const audioPath = `${fileName.replace(/ /g, '_')}.mp3`;
-            await fs.promises.writeFile(audioPath, response.audioContent, 'binary');
-            await storage.bucket(bucketName).upload(audioPath, { destination: audioPath });
-            const publicAudioUrl = `https://storage.googleapis.com/${bucketName}/${audioPath}`;
-            console.log(`Public URL for audio: ${publicAudioUrl}`);
-            sendAudioMessage(publicAudioUrl, fromNumber);
-            await fs.promises.unlink(audioPath);
-        } catch (err) {
-            console.error(chalk.red('Error generating or uploading audio:', JSON.stringify(err, null, 2)));
-            sendMessage('Error generating or uploading audio commentary.', fromNumber);
         }
     }
 
@@ -209,7 +195,7 @@ const whatsappApiUrl = 'https://graph.facebook.com/v13.0/355645230970425/message
             const message = results.join('\n');
             sendMessage(message, fromNumber);
         } catch (error) {
-            console.error(chalk.red('Error handling multiple teams:', error));
+            console.error('Error handling multiple teams:', error);
             sendMessage('Error fetching team data.', fromNumber);
         }
     }
@@ -254,66 +240,9 @@ Enjoy and stay tuned for NFL updates! 🏈`;
         res.send('NFL Info Service is running');
     });
 
-    // Webhook to handle incoming messages
-    app.post('/webhook', async (req, res) => {
-        try {
-            console.log('Incoming webhook payload:', JSON.stringify(req.body, null, 2));
-            
-            if (!req.body.entry || !req.body.entry[0].changes[0].value.messages[0]) {
-                console.log('Invalid webhook payload:', JSON.stringify(req.body, null, 2));
-                return res.status(400).send('Invalid webhook payload');
-            }
-
-            const incomingMsg = req.body.entry[0].changes[0].value.messages[0].text.body.trim();
-            const fromNumber = req.body.entry[0].changes[0].value.messages[0].from;
-
-            console.log(chalk.blue(`Received message from ${fromNumber}: ${incomingMsg}`));
-
-            userPrompts.push(incomingMsg); // Save the prompt
-            const parts = incomingMsg.toLowerCase().split(' ');
-
-            if (parts[0] === 'start') {
-                sendWelcomeMessage(fromNumber);
-            } else if (incomingMsg.toLowerCase() === 'nfl scores') {
-                const scoresData = await getNflScores();
-                sendMessage(scoresData.message, fromNumber);
-            } else if (incomingMsg.toLowerCase().startsWith('team ')) {
-                const teamName = incomingMsg.slice(5).trim();
-                const teamInfoMessage = await getTeamInfo(teamName);
-                sendMessage(teamInfoMessage, fromNumber);
-            } else if (incomingMsg.toLowerCase().startsWith('follow ')) {
-                const teamNames = incomingMsg.slice(7, -1).trim();
-                const frequency = parseInt(parts[parts.length - 1], 10);
-                if (!isNaN(frequency)) {
-                    if (optInUsers[fromNumber] && optInUsers[fromNumber].job) {
-                        optInUsers[fromNumber].job.stop();
-                    }
-                    optInUsers[fromNumber] = { teams: teamNames.split(','), frequency };
-                    scheduleNflUpdates();
-                    sendMessage(`You have opted in to receive updates for teams: ${teamNames} every ${frequency} minutes.`, fromNumber);
-                } else {
-                    sendMessage('Please provide a valid frequency in minutes.', fromNumber);
-                }
-            } else if (incomingMsg.toLowerCase() === 'finish updates') {
-                if (optInUsers[fromNumber] && optInUsers[fromNumber].job) {
-                    optInUsers[fromNumber].job.stop();
-                    delete optInUsers[fromNumber].job;
-                }
-                sendMessage('You have successfully opted out of updates.', fromNumber);
-            } else {
-                handleMultipleTeams(incomingMsg, fromNumber);
-            }
-
-            res.send('<Response></Response>');
-        } catch (error) {
-            console.error('Error handling webhook:', error);
-            res.status(500).send('Internal server error');
-        }
-    });
-
     // Start the Express server
+    const port = process.env.PORT || 3000;
     app.listen(port, () => {
         console.log('Server is running on port', port);
-
     });
 })();
