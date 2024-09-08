@@ -105,7 +105,7 @@ function handleUserSubscriptions() {
 
 // Send a combined help/start message
 async function sendHelpMessage(number) {
-    const message = `🎉 Welcome to NFL Feed! 🏈
+    const message = `🎉 Welcome to Football Feed! 🏈
 
 Here are some commands you can use:
 - "scores [team]" 📊: Get the current score for a specific team.
