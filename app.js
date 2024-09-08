@@ -2,9 +2,6 @@ require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
 const bodyParser = require('body-parser');
-const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
-const { Storage } = require('@google-cloud/storage');
-const fs = require('fs');
 const cron = require('node-cron');
 
 const app = express();
@@ -18,11 +15,7 @@ const whatsappApiUrl = process.env.WHATSAPP_API_URL;
 const nflScoreboardApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 const nflTeamApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams';
 
-const ttsClient = new TextToSpeechClient({ keyFilename: process.env.TTS_KEY_FILE });
-const storage = new Storage({ keyFilename: process.env.STORAGE_KEY_FILE });
-const bucketName = process.env.BUCKET_NAME;
-
-let userPreferences = {};
+let userSubscriptions = {};
 
 // Helper function to send a WhatsApp message
 async function sendMessage(message, number) {
@@ -41,7 +34,7 @@ async function sendMessage(message, number) {
     }
 }
 
-// Fetch NFL scores with error handling
+// Fetch NFL scores
 async function fetchNflScores() {
     try {
         const response = await axios.get(nflScoreboardApiUrl);
@@ -52,19 +45,19 @@ async function fetchNflScores() {
     }
 }
 
-// Fetch team information with proper checks
+// Fetch team information
 async function fetchTeamInfo(teamName) {
     try {
         const response = await axios.get(nflTeamApiUrl);
         const teams = response.data.sports[0].leagues[0].teams;
-        return teams.find(team => team.team.displayName.toLowerCase() === teamName.toLowerCase()) || null;
+        return teams.find(team => team.team.displayName.toLowerCase().includes(teamName.toLowerCase())) || null;
     } catch (error) {
         console.error('Error fetching team info:', error.message || error);
         return null;
     }
 }
 
-// Format game information
+// Format game summary
 function formatGameSummary(game) {
     if (!game || !game.competitions[0]) return 'No game data available.';
     
@@ -73,16 +66,19 @@ function formatGameSummary(game) {
     return `${home.team.displayName} vs ${away.team.displayName}: ${home.score} - ${away.score}`;
 }
 
+// Format venue information
 function formatVenueInfo(game) {
     const venue = game.competitions[0].venue;
     return venue ? `Venue: ${venue.fullName} (${venue.address.city}, ${venue.address.state})` : 'Venue information not available.';
 }
 
+// Format broadcast information
 function formatBroadcastInfo(game) {
     const broadcasts = game.competitions[0].broadcasts.map(b => b.names.join(', ')).join(', ');
     return broadcasts ? `Broadcasts: ${broadcasts}` : 'Broadcast information not available.';
 }
 
+// Format odds information
 function formatOddsInfo(game) {
     if (!game.competitions[0].odds || !game.competitions[0].odds[0]) return 'Odds information not available.';
     
@@ -90,21 +86,34 @@ function formatOddsInfo(game) {
     return `Odds: ${odds.homeTeamOdds.team.abbreviation} ${odds.details} (O/U: ${odds.overUnder})`;
 }
 
+// Handle user subscriptions
+function handleUserSubscriptions() {
+    Object.keys(userSubscriptions).forEach(number => {
+        const { teams, frequency } = userSubscriptions[number];
+        if (teams && frequency) {
+            cron.schedule(`*/${frequency} * * * *`, async () => {
+                const scoreboard = await fetchNflScores();
+                const messages = teams.map(teamName => {
+                    const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
+                    return game ? formatGameSummary(game) : `No game found for ${teamName}.`;
+                }).join('\n');
+                await sendMessage(messages, number);
+            });
+        }
+    });
+}
+
 // Send a combined help/start message
 async function sendHelpMessage(number) {
     const message = `🎉 Welcome to NFL Feed! 🏈
 
 Here are some commands you can use:
-- "nfl scores" 📊: Get the current NFL scores.
-- "team [team name]" 🏈: Get the stats for a specific team.
-- "follow [team names] [minutes]" 🏈: Receive updates for specific teams at your chosen interval.
-- "finish updates" 🚫: Stop receiving updates.
-- "game score [team]" 🏟️: Get the score of a game involving a specific team.
-- "venue [team]" 🏟️: Get the venue information of a game involving a specific team.
-- "TV [team]" 📺: Get the broadcast information of a game involving a specific team.
-- "odds [team]" 🎲: Get the odds information of a game involving a specific team.
-- "set favorite [team]" ⭐: Set your favorite team to get quick updates.
-- "my team" 🏈: Get updates about your favorite team.
+- "scores [team]" 📊: Get the current score for a specific team.
+- "venue [team]" 🏟️: Get the venue information for a specific team.
+- "TV [team]" 📺: Get the broadcast information for a specific team.
+- "odds [team]" 🎲: Get the odds information for a specific team.
+- "set updates [team names] [minutes]" 🕒: Set update frequency for specific teams (e.g., "set updates Chiefs, Giants 15").
+- "stop updates" 🚫: Stop receiving updates.
 - "help" 📖: Display this help message.
 
 Enjoy and stay tuned for NFL updates! 🏈`;
@@ -119,58 +128,42 @@ app.post('/webhook', async (req, res) => {
 
         if (incomingMsg === 'start' || incomingMsg === 'help') {
             await sendHelpMessage(fromNumber);
-        } else if (incomingMsg === 'nfl scores') {
+        } else if (incomingMsg.startsWith('scores ')) {
+            const teamName = incomingMsg.slice(7).trim();
             const scoreboard = await fetchNflScores();
-            const message = scoreboard.length > 0 
-                ? scoreboard.map(game => formatGameSummary(game)).join('\n')
-                : 'No current NFL games available.';
-            await sendMessage(message, fromNumber);
-        } else if (incomingMsg.startsWith('team ')) {
-            const teamName = incomingMsg.slice(5).trim();
-            const teamInfo = await fetchTeamInfo(teamName);
-            const message = teamInfo 
-                ? `${teamInfo.team.displayName} Stats:\n${JSON.stringify(teamInfo.team, null, 2)}` 
-                : `Team ${teamName} not found.`;
-            await sendMessage(message, fromNumber);
-        } else if (incomingMsg.startsWith('game score ')) {
-            const teamName = incomingMsg.slice(11).trim();
-            const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
             const message = game ? formatGameSummary(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
         } else if (incomingMsg.startsWith('venue ')) {
             const teamName = incomingMsg.slice(6).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
             const message = game ? formatVenueInfo(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
         } else if (incomingMsg.startsWith('tv ')) {
             const teamName = incomingMsg.slice(3).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
             const message = game ? formatBroadcastInfo(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
         } else if (incomingMsg.startsWith('odds ')) {
             const teamName = incomingMsg.slice(5).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
             const message = game ? formatOddsInfo(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
-        } else if (incomingMsg.startsWith('set favorite ')) {
-            const teamName = incomingMsg.slice(13).trim();
-            userPreferences[fromNumber] = teamName;
-            await sendMessage(`Your favorite team is set to ${teamName}.`, fromNumber);
-        } else if (incomingMsg === 'my team') {
-            const teamName = userPreferences[fromNumber];
-            if (teamName) {
-                const teamInfo = await fetchTeamInfo(teamName);
-                const message = teamInfo 
-                    ? `${teamInfo.team.displayName} Stats:\n${JSON.stringify(teamInfo.team, null, 2)}` 
-                    : `Team ${teamName} not found.`;
-                await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('set updates ')) {
+            const [teamNames, frequency] = incomingMsg.slice(12).trim().split(/ +(?=\d+$)/);
+            if (!isNaN(frequency)) {
+                userSubscriptions[fromNumber] = { teams: teamNames.split(','), frequency: parseInt(frequency) };
+                handleUserSubscriptions();
+                await sendMessage(`You will receive updates every ${frequency} minutes for: ${teamNames}.`, fromNumber);
             } else {
-                await sendMessage(`You haven't set a favorite team yet. Use "set favorite [team]" to set one.`, fromNumber);
+                await sendMessage('Please provide a valid frequency in minutes.', fromNumber);
             }
+        } else if (incomingMsg === 'stop updates') {
+            delete userSubscriptions[fromNumber];
+            await sendMessage('You have successfully stopped updates.', fromNumber);
         } else {
             await sendMessage(`Unknown command. Type "help" to see available commands.`, fromNumber);
         }
