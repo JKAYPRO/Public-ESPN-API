@@ -34,7 +34,7 @@ async function sendMessage(message, number) {
     }
 }
 
-// Fetch NFL scores
+// Fetch NFL scores with proper error handling
 async function fetchNflScores() {
     try {
         const response = await axios.get(nflScoreboardApiUrl);
@@ -45,7 +45,7 @@ async function fetchNflScores() {
     }
 }
 
-// Fetch team information
+// Fetch team information with proper checks and error handling
 async function fetchTeamInfo(teamName) {
     try {
         const response = await axios.get(nflTeamApiUrl);
@@ -57,16 +57,48 @@ async function fetchTeamInfo(teamName) {
     }
 }
 
-// Format game summary
+// Format game summary with validation
 function formatGameSummary(game) {
-    if (!game || !game.competitions[0]) return 'No game data available.';
-    
-    const home = game.competitions[0].competitors[0];
-    const away = game.competitions[0].competitors[1];
+    if (!game || !game.competitions || !game.competitions[0] || !game.competitions[0].competitors) {
+        return 'No game data available.';
+    }
+
+    const home = game.competitions[0].competitors.find(c => c.homeAway === 'home');
+    const away = game.competitions[0].competitors.find(c => c.homeAway === 'away');
     return `${home.team.displayName} vs ${away.team.displayName}: ${home.score} - ${away.score}`;
 }
 
-// Handle user subscriptions
+// Format venue information with validation
+function formatVenueInfo(game) {
+    if (!game || !game.competitions || !game.competitions[0] || !game.competitions[0].venue) {
+        return 'Venue information not available.';
+    }
+
+    const venue = game.competitions[0].venue;
+    return `Venue: ${venue.fullName} (${venue.address.city}, ${venue.address.state})`;
+}
+
+// Format broadcast information with validation
+function formatBroadcastInfo(game) {
+    if (!game || !game.competitions || !game.competitions[0] || !game.competitions[0].broadcasts) {
+        return 'Broadcast information not available.';
+    }
+
+    const broadcasts = game.competitions[0].broadcasts.map(b => b.names.join(', ')).join(', ');
+    return `Broadcasts: ${broadcasts}`;
+}
+
+// Format odds information with validation
+function formatOddsInfo(game) {
+    if (!game || !game.competitions || !game.competitions[0] || !game.competitions[0].odds || !game.competitions[0].odds[0]) {
+        return 'Odds information not available.';
+    }
+
+    const odds = game.competitions[0].odds[0];
+    return `Odds: ${odds.homeTeamOdds.team.abbreviation} ${odds.details} (O/U: ${odds.overUnder})`;
+}
+
+// Handle user subscriptions with proper checks
 async function handleUserSubscriptions() {
     const scoreboard = await fetchNflScores();
     const currentTime = new Date();
@@ -92,7 +124,7 @@ cron.schedule('* * * * *', handleUserSubscriptions); // Runs every minute
 
 // Send a combined help/start message
 async function sendHelpMessage(number) {
-    const message = `🎉 Welcome to Football Feed! 🏈
+    const message = `🎉 Welcome to NFL Feed! 🏈
 
 Here are some commands you can use:
 - "score [team]" 📊: Get the current score for a specific team.
@@ -148,9 +180,9 @@ app.post('/webhook', async (req, res) => {
             await sendMessage(message, fromNumber);
         } else if (incomingMsg.startsWith('set updates ')) {
             const [teamNames, frequency] = incomingMsg.slice(12).trim().split(/ +(?=\d+$)/);
-            if (!isNaN(frequency)) {
+            if (!isNaN(frequency) && parseInt(frequency) > 0) {
                 userSubscriptions[fromNumber] = {
-                    teams: teamNames.split(','),
+                    teams: teamNames.split(',').map(t => t.trim()),
                     frequency: parseInt(frequency),
                     lastUpdated: new Date()
                 };
