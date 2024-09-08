@@ -66,49 +66,37 @@ function formatGameSummary(game) {
     return `${home.team.displayName} vs ${away.team.displayName}: ${home.score} - ${away.score}`;
 }
 
-// Format venue information
-function formatVenueInfo(game) {
-    const venue = game.competitions[0].venue;
-    return venue ? `Venue: ${venue.fullName} (${venue.address.city}, ${venue.address.state})` : 'Venue information not available.';
-}
-
-// Format broadcast information
-function formatBroadcastInfo(game) {
-    const broadcasts = game.competitions[0].broadcasts.map(b => b.names.join(', ')).join(', ');
-    return broadcasts ? `Broadcasts: ${broadcasts}` : 'Broadcast information not available.';
-}
-
-// Format odds information
-function formatOddsInfo(game) {
-    if (!game.competitions[0].odds || !game.competitions[0].odds[0]) return 'Odds information not available.';
-    
-    const odds = game.competitions[0].odds[0];
-    return `Odds: ${odds.homeTeamOdds.team.abbreviation} ${odds.details} (O/U: ${odds.overUnder})`;
-}
-
 // Handle user subscriptions
-function handleUserSubscriptions() {
-    Object.keys(userSubscriptions).forEach(number => {
-        const { teams, frequency } = userSubscriptions[number];
-        if (teams && frequency) {
-            cron.schedule(`*/${frequency} * * * *`, async () => {
-                const scoreboard = await fetchNflScores();
-                const messages = teams.map(teamName => {
-                    const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
-                    return game ? formatGameSummary(game) : `No game found for ${teamName}.`;
-                }).join('\n');
-                await sendMessage(messages, number);
-            });
+async function handleUserSubscriptions() {
+    const scoreboard = await fetchNflScores();
+    const currentTime = new Date();
+
+    for (const number in userSubscriptions) {
+        const { teams, frequency, lastUpdated } = userSubscriptions[number];
+        const timeSinceLastUpdate = (currentTime - new Date(lastUpdated)) / 60000; // time in minutes
+
+        if (timeSinceLastUpdate >= frequency) {
+            const messages = teams.map(teamName => {
+                const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
+                return game ? formatGameSummary(game) : `No game found for ${teamName}.`;
+            }).join('\n');
+
+            await sendMessage(messages, number);
+            userSubscriptions[number].lastUpdated = currentTime; // Update last updated time
         }
-    });
+    }
 }
+
+// Cron job to check and send updates
+cron.schedule('* * * * *', handleUserSubscriptions); // Runs every minute
 
 // Send a combined help/start message
 async function sendHelpMessage(number) {
     const message = `🎉 Welcome to Football Feed! 🏈
 
 Here are some commands you can use:
-- "scores [team]" 📊: Get the current score for a specific team.
+- "score [team]" 📊: Get the current score for a specific team.
+- "all scores" 📊: Get the current scores for all ongoing NFL games.
 - "venue [team]" 🏟️: Get the venue information for a specific team.
 - "TV [team]" 📺: Get the broadcast information for a specific team.
 - "odds [team]" 🎲: Get the odds information for a specific team.
@@ -128,11 +116,17 @@ app.post('/webhook', async (req, res) => {
 
         if (incomingMsg === 'start' || incomingMsg === 'help') {
             await sendHelpMessage(fromNumber);
-        } else if (incomingMsg.startsWith('scores ')) {
-            const teamName = incomingMsg.slice(7).trim();
+        } else if (incomingMsg.startsWith('score ')) {
+            const teamName = incomingMsg.slice(6).trim();
             const scoreboard = await fetchNflScores();
             const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase().includes(teamName.toLowerCase())));
             const message = game ? formatGameSummary(game) : `No game found for ${teamName}.`;
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg === 'all scores') {
+            const scoreboard = await fetchNflScores();
+            const message = scoreboard.length > 0 
+                ? scoreboard.map(game => formatGameSummary(game)).join('\n')
+                : 'No current NFL games available.';
             await sendMessage(message, fromNumber);
         } else if (incomingMsg.startsWith('venue ')) {
             const teamName = incomingMsg.slice(6).trim();
@@ -155,8 +149,11 @@ app.post('/webhook', async (req, res) => {
         } else if (incomingMsg.startsWith('set updates ')) {
             const [teamNames, frequency] = incomingMsg.slice(12).trim().split(/ +(?=\d+$)/);
             if (!isNaN(frequency)) {
-                userSubscriptions[fromNumber] = { teams: teamNames.split(','), frequency: parseInt(frequency) };
-                handleUserSubscriptions();
+                userSubscriptions[fromNumber] = {
+                    teams: teamNames.split(','),
+                    frequency: parseInt(frequency),
+                    lastUpdated: new Date()
+                };
                 await sendMessage(`You will receive updates every ${frequency} minutes for: ${teamNames}.`, fromNumber);
             } else {
                 await sendMessage('Please provide a valid frequency in minutes.', fromNumber);
