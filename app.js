@@ -4,6 +4,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
 const { Storage } = require('@google-cloud/storage');
+const RSSParser = require('rss-parser');
 const cron = require('node-cron');
 
 const app = express();
@@ -16,17 +17,15 @@ const whatsappApiUrl = process.env.WHATSAPP_API_URL;
 
 const nflScoreboardApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 const nflTeamApiUrl = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams';
+const rssFeedUrl = 'https://www.espn.com/espn/rss/nfl/news';
 
 const ttsClient = new TextToSpeechClient({ keyFilename: process.env.TTS_KEY_FILE });
 const storage = new Storage({ keyFilename: process.env.STORAGE_KEY_FILE });
 const bucketName = process.env.BUCKET_NAME;
 
-let teamMap = {
-    giants: "new york giants",
-    jets: "new york jets",
-    falcons: "atlanta falcons",
-    // Add more shorthand to full name mappings as needed
-};
+const rssParser = new RSSParser();
+
+let userPreferences = {};
 
 // Helper function to send a WhatsApp message
 async function sendMessage(message, number) {
@@ -61,10 +60,28 @@ async function fetchTeamInfo(teamName) {
     try {
         const response = await axios.get(nflTeamApiUrl);
         const teams = response.data.sports[0].leagues[0].teams;
-        return teams.find(team => team.team.displayName.toLowerCase() === teamName.toLowerCase()) || null;
+        return teams.find(team => team.team.displayName.toLowerCase() === teamName.toLowerCase() ||
+            team.team.shortDisplayName.toLowerCase() === teamName.toLowerCase() ||
+            team.team.abbreviation.toLowerCase() === teamName.toLowerCase()) || null;
     } catch (error) {
         console.error('Error fetching team info:', error.message || error);
         return null;
+    }
+}
+
+// Fetch and parse the RSS feed
+async function fetchNflNews() {
+    try {
+        const feed = await rssParser.parseURL(rssFeedUrl);
+        const articles = feed.items.slice(0, 5); // Get the latest 5 articles
+        return articles.map(article => ({
+            title: article.title,
+            link: article.link,
+            description: article.contentSnippet
+        }));
+    } catch (error) {
+        console.error('Error fetching NFL news:', error.message || error);
+        return [];
     }
 }
 
@@ -94,38 +111,27 @@ function formatOddsInfo(game) {
     return `Odds: ${odds.homeTeamOdds.team.abbreviation} ${odds.details} (O/U: ${odds.overUnder})`;
 }
 
-// Format team recap information
-async function formatTeamRecap(teamInfo) {
-    const statsUrl = `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamInfo.team.id}/stats?season=2024`;
-    const statsResponse = await axios.get(statsUrl);
-    const stats = statsResponse.data || {};
-
-    return `Team Recap for ${teamInfo.team.displayName}:\nWins: ${stats.wins}, Losses: ${stats.losses}\nTotal Yards: ${stats.totalYards}, Points Scored: ${stats.pointsScored}`;
-}
-
-// Format game leader information
-function formatGameLeaderInfo(game) {
-    const leaders = game.competitions[0].leaders || [];
-    return leaders.length > 0
-        ? leaders.map(leader => `${leader.displayName}: ${leader.athlete.displayName} (${leader.value})`).join('\n')
-        : 'Game leader information not available.';
+// Function to send news updates
+async function sendNewsUpdate(number) {
+    const articles = await fetchNflNews();
+    if (articles.length > 0) {
+        const message = articles.map(article => `*${article.title}*\n${article.description}\nRead more: ${article.link}\n`).join('\n');
+        await sendMessage(message, number);
+    } else {
+        await sendMessage('No news articles available at the moment.', number);
+    }
 }
 
 // Send a combined help/start message
 async function sendHelpMessage(number) {
-    const message = `🎉 Welcome to NFL Feed! 🏈
+    const message = `🎉 Welcome to Football Feed! 🏈
 
 Here are some commands you can use:
-- "scores" 📊: Get the current NFL scores.
-- "team [team name]" 🏈: Get the stats for a specific team.
-- "recap [team name]" 🏈: Get a recap for a specific team.
-- "leaders [team name]" 🏆: Get the game leaders for a specific team.
+- "all scores" 📊: Get all game scores.
 - "game score [team]" 🏟️: Get the score of a game involving a specific team.
 - "venue [team]" 🏟️: Get the venue information of a game involving a specific team.
-- "TV [team]" 📺: Get the broadcast information of a game involving a specific team.
-- "odds [team]" 🎲: Get the odds information of a game involving a specific team.
-- "set frequency [minutes]" ⏰: Set how often you want to receive updates.
-- "stop updates" 🚫: Stop receiving updates.
+- "tv [team]" 📺: Get the broadcast information of a game involving a specific team.
+- "news" 📰: Get the latest NFL news.
 - "help" 📖: Display this help message.
 
 Enjoy and stay tuned for NFL updates! 🏈`;
@@ -133,90 +139,76 @@ Enjoy and stay tuned for NFL updates! 🏈`;
     await sendMessage(message, number);
 }
 
+// Webhook handling logic
 app.post('/webhook', async (req, res) => {
     try {
-        const incomingMsg = req.body.entry[0].changes[0].value.messages[0].text.body.trim().toLowerCase();
-        const fromNumber = req.body.entry[0].changes[0].value.messages[0].from;
+        const incomingMsg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.text?.body?.trim().toLowerCase();
+        const fromNumber = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
 
-        // Handle shorthand team names
-        const incomingTeamName = incomingMsg.split(' ').slice(-1)[0];
-        const fullTeamName = teamMap[incomingTeamName] || incomingTeamName;
+        if (!incomingMsg || !fromNumber) {
+            console.error('Invalid incoming message format:', req.body);
+            return res.sendStatus(400);
+        }
 
-        // Command patterns with team name extraction
-        const commands = {
-            scores: /^scores$/,
-            team: new RegExp(`^team\\s${fullTeamName}$`),
-            gameScore: new RegExp(`^game score\\s${fullTeamName}$`),
-            venue: new RegExp(`^venue\\s${fullTeamName}$`),
-            tv: new RegExp(`^tv\\s${fullTeamName}$`),
-            odds: new RegExp(`^odds\\s${fullTeamName}$`),
-            recap: new RegExp(`^recap\\s${fullTeamName}$`),
-            leaders: new RegExp(`^leaders\\s${fullTeamName}$`),
-            setFrequency: /^set frequency\s(\d+)$/
-        };
-
-        let match;
         if (incomingMsg === 'start' || incomingMsg === 'help') {
             await sendHelpMessage(fromNumber);
-        } else if (match = incomingMsg.match(commands.scores)) {
+        } else if (incomingMsg === 'nfl scores') {
             const scoreboard = await fetchNflScores();
             const message = scoreboard.length > 0 
                 ? scoreboard.map(game => formatGameSummary(game)).join('\n')
                 : 'No current NFL games available.';
             await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.team)) {
-            const teamInfo = await fetchTeamInfo(fullTeamName);
+        } else if (incomingMsg === 'all scores') {
+            const scoreboard = await fetchNflScores();
+            const message = scoreboard.length > 0 
+                ? scoreboard.map(game => formatGameSummary(game)).join('\n')
+                : 'No current NFL games available.';
+            await sendMessage(message, fromNumber);
+        } else if (incomingMsg.startsWith('team ')) {
+            const teamName = incomingMsg.slice(5).trim();
+            const teamInfo = await fetchTeamInfo(teamName);
             const message = teamInfo 
-                ? await formatTeamRecap(teamInfo) 
-                : `Team ${fullTeamName} not found.`;
+                ? `${teamInfo.team.displayName} Stats:\n${JSON.stringify(teamInfo.team, null, 2)}` 
+                : `Team ${teamName} not found.`;
             await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.gameScore)) {
+        } else if (incomingMsg.startsWith('game score ')) {
+            const teamName = incomingMsg.slice(11).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === fullTeamName.toLowerCase()));
-            const message = game ? formatGameSummary(game) : `No game found for ${fullTeamName}.`;
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatGameSummary(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.venue)) {
+        } else if (incomingMsg.startsWith('venue ')) {
+            const teamName = incomingMsg.slice(6).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === fullTeamName.toLowerCase()));
-            const message = game ? formatVenueInfo(game) : `No game found for ${fullTeamName}.`;
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatVenueInfo(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.tv)) {
+        } else if (incomingMsg.startsWith('tv ')) {
+            const teamName = incomingMsg.slice(3).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === fullTeamName.toLowerCase()));
-            const message = game ? formatBroadcastInfo(game) : `No game found for ${fullTeamName}.`;
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatBroadcastInfo(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.odds)) {
+        } else if (incomingMsg.startsWith('odds ')) {
+            const teamName = incomingMsg.slice(5).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === fullTeamName.toLowerCase()));
-            const message = game ? formatOddsInfo(game) : `No game found for ${fullTeamName}.`;
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatOddsInfo(game) : `No game found for ${teamName}.`;
             await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.recap)) {
-            const teamInfo = await fetchTeamInfo(fullTeamName);
-            const message = teamInfo 
-                ? await formatTeamRecap(teamInfo) 
-                : `Team ${fullTeamName} not found.`;
-            await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.leaders)) {
+        } else if (incomingMsg === 'news') {
+            await sendNewsUpdate(fromNumber);
+        } else if (incomingMsg.startsWith('recap ')) {
+            const teamName = incomingMsg.slice(6).trim();
             const scoreboard = await fetchNflScores();
-            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === fullTeamName.toLowerCase()));
-            const message = game ? formatGameLeaderInfo(game) : `No game found for ${fullTeamName}.`;
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatRecap(game) : `No recap available for ${teamName}.`;
             await sendMessage(message, fromNumber);
-        } else if (match = incomingMsg.match(commands.setFrequency)) {
-            const minutes = parseInt(match[1], 10);
-            // Logic to set up a cron job for sending updates every X minutes
-            const cronExpression = `*/${minutes} * * * *`;
-            cron.schedule(cronExpression, async () => {
-                const scoreboard = await fetchNflScores();
-                const message = scoreboard.length > 0 
-                    ? scoreboard.map(game => formatGameSummary(game)).join('\n')
-                    : 'No current NFL games available.';
-                await sendMessage(message, fromNumber);
-            });
-            await sendMessage(`You will receive updates every ${minutes} minutes.`, fromNumber);
-        } else if (incomingMsg === 'stop updates') {
-            // Logic to stop all cron jobs or notifications for this user
-            cron.getTasks().forEach(task => task.stop());
-            await sendMessage('Updates have been stopped.', fromNumber);
+        } else if (incomingMsg.startsWith('leaders ')) {
+            const teamName = incomingMsg.slice(8).trim();
+            const scoreboard = await fetchNflScores();
+            const game = scoreboard.find(g => g.competitions[0].competitors.some(c => c.team.displayName.toLowerCase() === teamName.toLowerCase()));
+            const message = game ? formatLeaders(game) : `No leader information available for ${teamName}.`;
+            await sendMessage(message, fromNumber);
         } else {
             await sendMessage(`Unknown command. Type "help" to see available commands.`, fromNumber);
         }
@@ -227,6 +219,38 @@ app.post('/webhook', async (req, res) => {
         res.status(500).send('Internal server error');
     }
 });
+
+// Sample function to format the recap information
+function formatRecap(game) {
+    // Implement a more in-depth recap using available game data
+    const home = game.competitions[0].competitors[0];
+    const away = game.competitions[0].competitors[1];
+    return `Recap: ${home.team.displayName} vs ${away.team.displayName}\nScore: ${home.score} - ${away.score}\nDetails: [Add more details here]`;
+}
+
+// Sample function to format the game leaders information
+function formatLeaders(game) {
+    // Implement a more detailed breakdown of game leaders using available data
+    const leaders = game.leaders || [];
+    return leaders.length > 0
+        ? `Game Leaders:\n${leaders.map(leader => `${leader.displayName}: ${leader.value}`).join('\n')}`
+        : 'No leader information available.';
+}
+
+// Schedule task for periodic updates (user-defined intervals)
+function scheduleUpdate(number, interval) {
+    cron.schedule(`*/${interval} * * * *`, async () => {
+        try {
+            const scoreboard = await fetchNflScores();
+            const message = scoreboard.length > 0 
+                ? scoreboard.map(game => formatGameSummary(game)).join('\n')
+                : 'No current NFL games available.';
+            await sendMessage(message, number);
+        } catch (error) {
+            console.error(`Error sending scheduled update to ${number}:`, error.message || error);
+        }
+    });
+}
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
